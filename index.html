@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Contrôle Servo micro:bit</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #38bdf8;
+      --success: #22c55e;
+      --text: #f8fafc;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: var(--card);
+      padding: 28px 24px;
+      border-radius: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+      width: 100%;
+      max-width: 380px;
+      text-align: center;
+    }
+    h1 { font-size: 1.4rem; margin-top: 0; margin-bottom: 8px; }
+    .status {
+      font-size: 0.9rem;
+      color: #94a3b8;
+      margin-bottom: 20px;
+    }
+    .status.connected { color: var(--success); font-weight: 600; }
+    
+    #connectBtn {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 14px 20px;
+      font-size: 1rem;
+      font-weight: 700;
+      border-radius: 12px;
+      width: 100%;
+      cursor: pointer;
+      margin-bottom: 24px;
+    }
+    #connectBtn.connected {
+      background: #334155;
+      color: #e2e8f0;
+    }
+
+    .controls {
+      opacity: 0.35;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
+    }
+    .controls.active {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .angle-value {
+      font-size: 3.5rem;
+      font-weight: 800;
+      color: var(--accent);
+      margin: 10px 0;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      height: 8px;
+      margin: 20px 0;
+      accent-color: var(--accent);
+    }
+
+    .grid-btns {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .step-btns {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+    button.preset {
+      background: #334155;
+      color: white;
+      border: none;
+      padding: 14px;
+      font-size: 1rem;
+      font-weight: 600;
+      border-radius: 10px;
+      cursor: pointer;
+    }
+    button.preset:active {
+      background: var(--accent);
+      color: #0f172a;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h1>Servo micro:bit BLE</h1>
+    <div id="statusText" class="status">Déconnecté</div>
+
+    <button id="connectBtn" onclick="toggleConnection()">Connecter la micro:bit</button>
+
+    <div id="controlPanel" class="controls">
+      <div class="angle-value"><span id="angleLabel">90</span>°</div>
+
+      <input type="range" id="angleSlider" min="0" max="180" value="90" oninput="onSliderInput(this.value)">
+
+      <!-- Boutons de positions fixes -->
+      <div class="grid-btns">
+        <button class="preset" onclick="setAngle(0)">0°</button>
+        <button class="preset" onclick="setAngle(90)">90°</button>
+        <button class="preset" onclick="setAngle(180)">180°</button>
+      </div>
+
+      <!-- Boutons pas à pas (comme A et B) -->
+      <div class="step-btns">
+        <button class="preset" onclick="stepAngle(-10)">- 10° (A)</button>
+        <button class="preset" onclick="stepAngle(10)">+ 10° (B)</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // UUIDs officiels du service UART Nordic / BBC micro:bit
+    const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+    const UART_CHAR_UUID_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+    const UART_CHAR_UUID_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+    let device = null;
+    let writeCharacteristic = null;
+    let currentAngle = 90;
+    let isSending = false;
+    let pendingAngle = null;
+
+    async function toggleConnection() {
+      if (device && device.gatt.connected) {
+        device.gatt.disconnect();
+        return;
+      }
+
+      try {
+        if (!navigator.bluetooth) {
+          alert("Web Bluetooth non détecté. Ouvrez cette page dans l'application Bluefy sur iPhone.");
+          return;
+        }
+
+        document.getElementById('statusText').innerText = "Recherche en cours...";
+
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'BBC micro:bit' }],
+          optionalServices: [UART_SERVICE_UUID]
+        });
+
+        device.addEventListener('gattserverdisconnected', onDisconnected);
+
+        document.getElementById('statusText').innerText = "Connexion GATT...";
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+        const characteristics = await service.getCharacteristics();
+
+        // Trouve automatiquement la caractéristique qui accepte l'écriture (RX sur micro:bit)
+        for (const c of characteristics) {
+          if (c.properties.write || c.properties.writeWithoutResponse) {
+            writeCharacteristic = c;
+            break;
+          }
+        }
+
+        if (!writeCharacteristic) {
+          throw new Error("Caractéristique d'écriture UART introuvable.");
+        }
+
+        // Interface activée
+        const statusEl = document.getElementById('statusText');
+        statusEl.innerText = "Connecté à " + device.name;
+        statusEl.classList.add('connected');
+
+        const btn = document.getElementById('connectBtn');
+        btn.innerText = "Déconnecter";
+        btn.classList.add('connected');
+
+        document.getElementById('controlPanel').classList.add('active');
+
+      } catch (err) {
+        console.error(err);
+        document.getElementById('statusText').innerText = "Erreur : " + err.message;
+      }
+    }
+
+    function onDisconnected() {
+      writeCharacteristic = null;
+      const statusEl = document.getElementById('statusText');
+      statusEl.innerText = "Déconnecté";
+      statusEl.classList.remove('connected');
+
+      const btn = document.getElementById('connectBtn');
+      btn.innerText = "Connecter la micro:bit";
+      btn.classList.remove('connected');
+
+      document.getElementById('controlPanel').classList.remove('active');
+    }
+
+    function onSliderInput(val) {
+      setAngle(parseInt(val));
+    }
+
+    function stepAngle(delta) {
+      let next = Math.max(0, Math.min(180, currentAngle + delta));
+      setAngle(next);
+    }
+
+    function setAngle(val) {
+      currentAngle = val;
+      document.getElementById('angleLabel').innerText = val;
+      document.getElementById('angleSlider').value = val;
+      sendAngleBLE(val);
+    }
+
+    // File d'attente anti-saturation BLE quand on glisse le slider rapidement
+    async function sendAngleBLE(angle) {
+      if (!writeCharacteristic) return;
+      pendingAngle = angle;
+      if (isSending) return;
+
+      isSending = true;
+      while (pendingAngle !== null) {
+        const target = pendingAngle;
+        pendingAngle = null;
+        const data = new TextEncoder().encode(target + "\n");
+        try {
+          if (writeCharacteristic.properties.writeWithoutResponse) {
+            await writeCharacteristic.writeValueWithoutResponse(data);
+          } else {
+            await writeCharacteristic.writeValue(data);
+          }
+        } catch (e) {
+          console.error("Erreur d'envoi BLE :", e);
+        }
+        // Pause de 40 ms pour laisser le temps au buffer Bluetooth de la micro:bit
+        await new Promise(r => setTimeout(r, 40));
+      }
+      isSending = false;
+    }
+  </script>
+</body>
+</html>
